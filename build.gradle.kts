@@ -8,6 +8,12 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 
 buildscript {
     repositories {
+        // Il plugin gradle di CloudStream viene compilato dal sorgente e pubblicato qui:
+        //   git clone https://github.com/recloudstream/gradle
+        //   ./gradlew publishToMavenLocal -Pversion=local
+        // Serve perche' JitPack restituisce metadata corrotto per master-SNAPSHOT
+        // (dichiara la versione "master-aster-SNAPSHOT" e Gradle la rifiuta).
+        mavenLocal()
         google()
         mavenCentral()
         maven("https://jitpack.io")
@@ -15,7 +21,7 @@ buildscript {
 
     dependencies {
         classpath("com.android.tools.build:gradle:9.1.1")
-        classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
+        classpath("com.lagradost.cloudstream3:gradle:local")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.21")
     }
 }

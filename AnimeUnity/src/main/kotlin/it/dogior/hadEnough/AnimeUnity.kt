@@ -31,6 +31,8 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.nodes.Element
 import java.text.Normalizer
@@ -68,6 +70,12 @@ class AnimeUnity(
         const val upcomingSectionName = "In Arrivo"
         
         var name = "AnimeUnity"
+        // headers e' condivisa fra tutte le coroutine. Servono DUE difese, non una:
+        // il mutex serializza la handshake (scrittori), e ogni lettore passa a OkHttp una
+        // copia immutabile (headers.toMap()). Con il solo mutex la corsa lettore-scrittore
+        // resta aperta: un clear() concorrente durante l'iterazione della mappa produce
+        // ConcurrentModificationException o una richiesta senza CSRF, cioe' il 419.
+        val headersMutex = Mutex()
         var headers = mapOf(
             "Host" to mainUrl.toHttpUrl().host,
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
@@ -429,7 +437,7 @@ class AnimeUnity(
         }
     }
 
-    private suspend fun ensureHeadersAndCookies(forceReset: Boolean = false) {
+    private suspend fun ensureHeadersAndCookies(forceReset: Boolean = false) = headersMutex.withLock {
         val currentHost = mainUrl.toHttpUrl().host
         val shouldRefreshHeaders = forceReset ||
             headers["Host"] != currentHost ||
@@ -443,7 +451,7 @@ class AnimeUnity(
     }
 
     private suspend fun setupHeadersAndCookies() {
-        val response = app.get("$mainUrl/archivio", headers = headers)
+        val response = app.get("$mainUrl/archivio", headers = headers.toMap())
 
         val csrfToken = response.document.head().select("meta[name=csrf-token]").attr("content")
         val cookies =
@@ -494,7 +502,7 @@ class AnimeUnity(
     }
 
     private suspend fun fetchArchiveBatch(url: String, requestData: RequestData): ApiResponse {
-        val response = app.post(url, headers = headers, requestBody = requestData.toRequestBody())
+        val response = app.post(url, headers = headers.toMap(), requestBody = requestData.toRequestBody())
         return parseJson<ApiResponse>(response.text)
     }
 
@@ -1103,7 +1111,7 @@ class AnimeUnity(
         ensureHeadersAndCookies(forceReset = true)
 
         val requestBody = RequestData(title = query, dubbed = 0).toRequestBody()
-        val response = app.post(url, headers = headers, requestBody = requestBody)
+        val response = app.post(url, headers = headers.toMap(), requestBody = requestBody)
 
         val responseObject = parseJson<ApiResponse>(response.text)
         val titles = responseObject.titles ?: emptyList()

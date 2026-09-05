@@ -149,7 +149,7 @@ open class AnimeWorldCore(isSplit: Boolean = false, val currentExtension: Curren
 
             val pagingWrapper = document.select("#paging-form").firstOrNull()
             val totalPages = pagingWrapper?.select("span.total")?.text()?.toIntOrNull()
-            hasNextPage = totalPages != null && (page + 1) < totalPages
+            hasNextPage = totalPages != null && page < totalPages
         }
 
         return newHomePageResponse(
@@ -260,7 +260,7 @@ open class AnimeWorldCore(isSplit: Boolean = false, val currentExtension: Curren
         }
         val pagingWrapper = document.select("#paging-form").firstOrNull()
         val totalPages = pagingWrapper?.select("span.total")?.text()?.toIntOrNull()
-        val hasNextPage = totalPages != null && (page + 1) < totalPages
+        val hasNextPage = totalPages != null && page < totalPages
 
         return newSearchResponseList(list, hasNextPage)
     }

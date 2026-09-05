@@ -55,6 +55,16 @@ jobs:
           echo SIMKL_CLIENT_ID=$SIMKL_CLIENT_ID >> secrets.properties
           echo ILCORSAROVIOLAVERCEL=$ILCORSAROVIOLAVERCEL >> secrets.properties
 
+      # JitPack serve metadata corrotto per com.github.recloudstream:gradle:master-SNAPSHOT
+      # (dichiara la versione "master-aster-SNAPSHOT" e Gradle la rifiuta). Compiliamo il
+      # plugin gradle dal sorgente e lo pubblichiamo in ~/.m2, come si fa in locale.
+      - name: Build CloudStream gradle plugin from source
+        run: |
+          git clone --depth 1 https://github.com/recloudstream/gradle.git $GITHUB_WORKSPACE/cs-gradle
+          cd $GITHUB_WORKSPACE/cs-gradle
+          chmod +x gradlew
+          ./gradlew publishToMavenLocal -Pversion=local
+
       - name: Build Plugins
         run: |
           cd $GITHUB_WORKSPACE/src
