@@ -20,6 +20,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # serve solo per pubblicare gli artefatti sul branch builds
     steps:
       - name: Checkout
         uses: actions/checkout@master
