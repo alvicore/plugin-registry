@@ -33,7 +33,7 @@ jobs:
           path: "builds"
       
       - name: Clean old builds
-        run: rm $GITHUB_WORKSPACE/builds/*.cs3
+        run: rm -f $GITHUB_WORKSPACE/builds/*.cs3   # -f: alla prima build non esiste nulla da rimuovere
 
       - name: Setup Java 17
         uses: actions/setup-java@v5
