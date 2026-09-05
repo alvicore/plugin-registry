@@ -1,0 +1,8 @@
+{
+  "name": "Plugin personali",
+  "description": "Fork personale con correzioni",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/alvicore/plugin-registry/builds/plugins.json"
+  ]
+}
