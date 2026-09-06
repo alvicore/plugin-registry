@@ -336,14 +336,24 @@ class StreamingCommunity(
     }
 
     private suspend fun getPoster(title: TitleProp): String? {
-        if (title.tmdbId != null) {
+        // FORK: la locandina veniva presa da uno scraping di themoviedb.org SENZA protezione,
+        // dentro load(). Se quel sito e' lento o irraggiungibile, l'eccezione usciva da load()
+        // e il titolo non si apriva affatto: un sito terzo che non c'entra nulla con lo
+        // streaming poteva rendere inutilizzabile l'app. Ora il fallimento degrada alla
+        // locandina del CDN del sito stesso.
+        val fallback = title.getBackgroundImageId()?.let { "https://$cdnHost/images/$it" }
+        if (title.tmdbId == null) return fallback
+
+        return runCatching {
             val tmdbUrl = "https://www.themoviedb.org/${title.type}/${title.tmdbId}"
             val resp = app.get(tmdbUrl).document
-            val img = resp.select("img.poster.w-full").attr("srcset").split(", ").last()
-            return img
-        } else {
-            return title.getBackgroundImageId().let { "https://$cdnHost/images/$it" }
-        }
+            resp.select("img.poster.w-full").attr("srcset")
+                .split(", ").lastOrNull()
+                // l'attributo srcset termina con il descrittore di densita' (" 2x"):
+                // senza toglierlo l'URL non carica
+                ?.substringBefore(" ")
+                ?.takeIf { it.isNotBlank() }
+        }.getOrNull() ?: fallback
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -495,15 +505,21 @@ class StreamingCommunity(
         if (data.isEmpty()) return false
         val loadData = parseJson<LoadData>(data)
 
-        val response = app.get(loadData.url).document
-        val iframeSrc = response.select("iframe").attr("src")
-
-        VixCloudExtractor().getUrl(
-            url = iframeSrc,
-            referer = siteRootUrl,
-            subtitleCallback = subtitleCallback,
-            callback = callback
-        )
+        // FORK: le due sorgenti erano in sequenza senza isolamento, quindi un'eccezione della
+        // prima impediva di provare la seconda, che e' indipendente (sta su un altro host e
+        // ricava il suo URL da loadData, non da questa risposta). Dentro il primo blocco c'e'
+        // anche la fetch dell'iframe: e' la parte con la superficie di guasto piu' grande
+        // (rete, DNS, timeout) e lasciarla fuori vanificava meta' della correzione.
+        runCatching {
+            val response = app.get(loadData.url).document
+            val iframeSrc = response.select("iframe").attr("src")
+            VixCloudExtractor().getUrl(
+                url = iframeSrc,
+                referer = siteRootUrl,
+                subtitleCallback = subtitleCallback,
+                callback = callback
+            )
+        }.onFailure { Log.w("StreamingCommunity", "VixCloud fallito: ${it.message}") }
 
         val vixsrcUrl = if (loadData.type == "movie") {
             "https://vixsrc.to/movie/${loadData.tmdbId}"
@@ -511,12 +527,14 @@ class StreamingCommunity(
             "https://vixsrc.to/tv/${loadData.tmdbId}/${loadData.seasonNumber}/${loadData.episodeNumber}"
         }
 
-        VixSrcExtractor().getUrl(
-            url = vixsrcUrl,
-            referer = "https://vixsrc.to/",
-            subtitleCallback = subtitleCallback,
-            callback = callback
-        )
+        runCatching {
+            VixSrcExtractor().getUrl(
+                url = vixsrcUrl,
+                referer = "https://vixsrc.to/",
+                subtitleCallback = subtitleCallback,
+                callback = callback
+            )
+        }.onFailure { Log.w("StreamingCommunity", "VixSrc fallito: ${it.message}") }
 
         return true
     }

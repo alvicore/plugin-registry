@@ -31,6 +31,7 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import android.util.Log
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -1268,23 +1269,34 @@ class AnimeUnity(
 
         val shouldLabelSources = playerSources.size > 1
 
+        // FORK: il ciclo non isolava le sorgenti, quindi un'eccezione sulla PRIMA (rete,
+        // pagina 5xx, script VixCloud assente) usciva da loadLinks e le successive non
+        // venivano nemmeno provate — annullando il fallback fra sub e dub. Si restituiva
+        // inoltre sempre true anche senza aver emesso un link: oggi l'app non consuma quel
+        // valore, quindi il cambio non altera il comportamento, ma rende onesto il contratto
+        // della funzione e corregge la schermata di test dei provider.
+        var emitted = false
         playerSources.forEach { playerSource ->
-            val document = app.get(playerSource.url).document
-            val sourceUrl = document.select("video-player").attr("embed_url")
-            if (sourceUrl.isBlank()) return@forEach
+            runCatching {
+                val document = app.get(playerSource.url).document
+                val sourceUrl = document.select("video-player").attr("embed_url")
+                if (sourceUrl.isBlank()) return@runCatching
 
-            val sourceSuffix = if (shouldLabelSources) " ${playerSource.label}" else ""
-            VixCloudExtractor(
-                sourceName = "VixCloud$sourceSuffix",
-                displayName = "AnimeUnity$sourceSuffix",
-            ).getUrl(
-                url = sourceUrl,
-                referer = mainUrl,
-                subtitleCallback = subtitleCallback,
-                callback = callback
-            )
+                val sourceSuffix = if (shouldLabelSources) " ${playerSource.label}" else ""
+                VixCloudExtractor(
+                    sourceName = "VixCloud$sourceSuffix",
+                    displayName = "AnimeUnity$sourceSuffix",
+                ).getUrl(
+                    url = sourceUrl,
+                    referer = mainUrl,
+                    subtitleCallback = subtitleCallback,
+                    callback = { link -> emitted = true; callback(link) }
+                )
+            }.onFailure {
+                Log.w("AnimeUnity", "Sorgente '${playerSource.label}' fallita: ${it.message}")
+            }
         }
 
-        return true
+        return emitted
     }
 }
