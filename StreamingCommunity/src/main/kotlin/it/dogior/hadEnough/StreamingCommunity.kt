@@ -205,6 +205,18 @@ class StreamingCommunity(
         )
     }
 
+    // FORK: quando il sito rilascia un nuovo frontend, la X-Inertia-Version tenuta in cache
+    // diventa stantia e il server risponde 409 con corpo VUOTO: il parse fallisce e il titolo
+    // non si apre piu' fino al riavvio dell'app (setupHeaders gira solo a cookie assente).
+    // Al primo 409 rifacciamo la handshake, che aggiorna la versione, e ritentiamo una volta.
+    private suspend fun getInertia(url: String) = app.get(url, headers = headers).let { first ->
+        if (first.code != 409) first else {
+            Log.w("StreamingCommunity", "409 Inertia-Version stantia, rifaccio la handshake")
+            setupHeaders()
+            app.get(url, headers = headers)
+        }
+    }
+
     private suspend fun setupHeaders() {
         val response = app.get("$mainUrl/archive")
         val cookieJar = linkedMapOf<String, String>()
@@ -361,7 +373,7 @@ class StreamingCommunity(
         if (headers["Cookie"].isNullOrEmpty()) {
             setupHeaders()
         }
-        val response = app.get(actualUrl, headers = headers)
+        val response = getInertia(actualUrl)
         val responseBody = response.body.string()
 
         val props = parseJson<InertiaResponse>(responseBody).props
@@ -467,7 +479,7 @@ class StreamingCommunity(
                 }
                 val url = "$mainUrl/titles/${title.id}-${title.slug}/season-${season.number}"
                 val obj =
-                    parseJson<InertiaResponse>(app.get(url, headers = headers).body.string())
+                    parseJson<InertiaResponse>(getInertia(url).body.string())
                 responseEpisodes.addAll(obj.props.loadedSeason?.episodes!!)
             }
             responseEpisodes.forEach { ep ->

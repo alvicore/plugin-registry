@@ -16,6 +16,12 @@ import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.AnimeSearchResponse
 import com.lagradost.cloudstream3.SearchResponse
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaType
+import org.json.JSONObject
+import com.lagradost.cloudstream3.syncproviders.SyncIdName
+import com.lagradost.cloudstream3.newSearchResponseList
+import com.lagradost.cloudstream3.SearchResponseList
 import com.lagradost.cloudstream3.ShowStatus
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
@@ -32,6 +38,9 @@ import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import android.util.Log
+import com.lagradost.cloudstream3.ErrorLoadingException
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -61,6 +70,25 @@ class AnimeUnity(
         @Suppress("ConstPropertyName")
         const val mainUrl = "https://www.animeunity.so"
         const val ARCHIVE_BATCH_SIZE = 30
+        // URL che arrivano a load() solo se il SyncRedirector non ha trovato il titolo
+        val SYNC_HOSTS = listOf("anilist.co/", "myanimelist.net/")
+        // Perche' l'ultimo getLoadUrl per quell'id e' fallito: load() lo mostra al posto di un
+        // generico "non trovato", che sarebbe falso quando a mancare sono Jikan/AniList o l'archivio.
+        // La chiave porta il namespace: l'id 204431 di AniList non e' l'id 204431 di MyAnimeList.
+        val lookupFailures = ConcurrentHashMap<String, String>()
+        // NiceHttp non puo' mettere in cache queste risposte: OkHttp memorizza solo le GET (le
+        // query AniList sono POST) e Jikan serve gia' scaduto. Senza questa mappa ogni card
+        // dell'anteprima e ogni click rifanno le stesse richieste ad AniList, che in modalita'
+        // degradata concede 30 richieste al minuto.
+        val metadataCache = ConcurrentHashMap<String, Pair<Long, Metadata>>()
+        const val MAX_LOOKUP_PAGES = 3
+        const val MAX_LOOKUP_FAILURES = 200
+        const val METADATA_TTL_MS = 60 * 60 * 1000L
+        const val METADATA_FAIL_TTL_MS = 2 * 60 * 1000L
+        val SEASON_SUFFIX = Regex(
+            """\s*[:\-\u2013]?\s*(?:(?:\d+(?:st|nd|rd|th)|final)\s+(?:season|part|cour)|(?:season|part|cour)\s+\d+|\b(?:ii|iii|iv|v|vi)|\d+)\s*$""",
+            RegexOption.IGNORE_CASE
+        )
         const val advancedSearchSectionName = "Ricerca avanzata"
         const val latestEpisodesSectionName = "Ultimi Episodi"
         const val calendarSectionName = "Calendario"
@@ -71,16 +99,20 @@ class AnimeUnity(
         const val upcomingSectionName = "In Arrivo"
         
         var name = "AnimeUnity"
-        // headers e' condivisa fra tutte le coroutine. Servono DUE difese, non una:
-        // il mutex serializza la handshake (scrittori), e ogni lettore passa a OkHttp una
-        // copia immutabile (headers.toMap()). Con il solo mutex la corsa lettore-scrittore
-        // resta aperta: un clear() concorrente durante l'iterazione della mappa produce
-        // ConcurrentModificationException o una richiesta senza CSRF, cioe' il 419.
+        // headers e' condivisa fra tutte le coroutine. Due regole: il mutex serializza la
+        // handshake, e la mappa e' uno snapshot IMMUTABILE sostituito con una sola
+        // assegnazione. Mai clear()+putAll(): fra i due passi c'e' una richiesta di rete, e
+        // chi leggeva in quel momento mandava all'archivio solo Host+User-Agent, che il
+        // server rifiuta con 419 e una pagina HTML (visto nei log quando la home apre piu'
+        // card in parallelo).
         val headersMutex = Mutex()
-        var headers = mapOf(
-            "Host" to mainUrl.toHttpUrl().host,
+        @Volatile
+        var headers: Map<String, String> = baseHeaders(mainUrl.toHttpUrl().host)
+
+        fun baseHeaders(host: String) = mapOf(
+            "Host" to host,
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
-        ).toMutableMap()
+        )
     }
 
     private data class ArchivePageResult(
@@ -438,42 +470,40 @@ class AnimeUnity(
         }
     }
 
-    private suspend fun ensureHeadersAndCookies(forceReset: Boolean = false) = headersMutex.withLock {
-        val currentHost = mainUrl.toHttpUrl().host
-        val shouldRefreshHeaders = forceReset ||
-            headers["Host"] != currentHost ||
-            headers["Referer"] != mainUrl ||
-            !headers.containsKey("Cookie")
+    private suspend fun ensureHeadersAndCookies() = headersMutex.withLock {
+        val current = headers
+        val shouldRefreshHeaders =
+            current["Host"] != mainUrl.toHttpUrl().host ||
+            current["Referer"] != mainUrl ||
+            !current.containsKey("Cookie")
 
         if (shouldRefreshHeaders) {
-            resetHeadersAndCookies()
             setupHeadersAndCookies()
         }
     }
 
+    /** Da chiamare con headersMutex preso. Nuova sessione, pubblicata con una sola assegnazione. */
     private suspend fun setupHeadersAndCookies() {
-        val response = app.get("$mainUrl/archivio", headers = headers.toMap())
+        val base = baseHeaders(mainUrl.toHttpUrl().host)
+        val response = app.get("$mainUrl/archivio", headers = base)
 
         val csrfToken = response.document.head().select("meta[name=csrf-token]").attr("content")
-        val cookies =
-            "XSRF-TOKEN=${response.cookies["XSRF-TOKEN"]}; animeunity_session=${response.cookies["animeunity_session"]}"
-        val h = mapOf(
+        val xsrf = response.cookies["XSRF-TOKEN"]
+        val session = response.cookies["animeunity_session"]
+        if (csrfToken.isBlank() || xsrf == null || session == null) {
+            // pagina senza handshake (challenge, manutenzione): meglio nessuna sessione, cosi' il
+            // prossimo ensure riprova, che una sessione con cookie "null" creduta valida
+            Log.w("AnimeUnity", "Handshake senza CSRF/cookie (HTTP ${response.code}): sessione non aggiornata")
+            headers = base
+            return
+        }
+        headers = base + mapOf(
             "X-Requested-With" to "XMLHttpRequest",
             "Content-Type" to "application/json;charset=utf-8",
             "X-CSRF-Token" to csrfToken,
             "Referer" to mainUrl,
-            "Cookie" to cookies
+            "Cookie" to "XSRF-TOKEN=$xsrf; animeunity_session=$session"
         )
-        headers.putAll(h)
-    }
-
-    private fun resetHeadersAndCookies() {
-        if (headers.isNotEmpty()) {
-            headers.clear()
-        }
-        headers["Host"] = mainUrl.toHttpUrl().host
-        headers["User-Agent"] =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
     }
 
     private suspend fun searchResponseBuilder(objectList: List<Anime>, episodeNumber: Int? = null): List<SearchResponse> {
@@ -502,9 +532,27 @@ class AnimeUnity(
         }
     }
 
+    /**
+     * Unica porta verso l'archivio. Una sessione scaduta o mancante vale un 419: si rinnova
+     * UNA volta e si riprova, ma solo se nessun'altra coroutine l'ha gia' rinnovata nel
+     * frattempo (identita' dello snapshot). Cosi' load() e getLoadUrl non forzano piu' una
+     * handshake a ogni chiamata, che moltiplicava le GET /archivio e apriva la corsa.
+     */
     private suspend fun fetchArchiveBatch(url: String, requestData: RequestData): ApiResponse {
-        val response = app.post(url, headers = headers.toMap(), requestBody = requestData.toRequestBody())
-        return parseJson<ApiResponse>(response.text)
+        ensureHeadersAndCookies()
+        val used = headers
+        val first = app.post(url, headers = used, requestBody = requestData.toRequestBody())
+        if (first.isSuccessful) return parseJson<ApiResponse>(first.text)
+
+        Log.w("AnimeUnity", "Archivio: HTTP ${first.code}, rinnovo la sessione e riprovo")
+        headersMutex.withLock { if (headers === used) setupHeadersAndCookies() }
+        // Se la handshake non ha prodotto una sessione, la seconda POST fallirebbe uguale:
+        // meglio fermarsi subito che raddoppiare le richieste verso un sito in difficolta'.
+        val renewed = headers
+        if (!renewed.containsKey("Cookie")) throw ErrorLoadingException("Sessione AnimeUnity non disponibile (HTTP ${first.code})")
+        val second = app.post(url, headers = renewed, requestBody = requestData.toRequestBody())
+        if (!second.isSuccessful) throw ErrorLoadingException("Archivio AnimeUnity: HTTP ${second.code}")
+        return parseJson<ApiResponse>(second.text)
     }
 
     private suspend fun fetchArchiveSectionPage(
@@ -952,7 +1000,6 @@ class AnimeUnity(
         }
 
         val url = sectionData.baseUrl + "get-animes"
-        ensureHeadersAndCookies()
 
         val requestData = getDataPerHomeSection(sectionData.key)
         val sectionCount = getSectionCount(sectionData.key)
@@ -1069,7 +1116,6 @@ class AnimeUnity(
         requestUrl: String,
     ): HomePageResponse {
         val url = "${requestUrl}get-animes"
-        ensureHeadersAndCookies()
 
         val sectionCount = getSectionCount("random")
         val (titles, total) = fetchRandomTitles(url, sectionCount)
@@ -1107,21 +1153,218 @@ class AnimeUnity(
         else -> RequestData()
     }
 
-    override suspend fun search(query: String): List<SearchResponse> {
+    // FORK: la ricerca faceva una sola POST con offset 0 e ignorava "tot", e siccome
+    // l'overload senza pagina viene incapsulato da CloudStream con hasNext=false, oltre i
+    // primi 30 risultati non si andava mai. Ora si impagina a blocchi di ARCHIVE_BATCH_SIZE.
+    override suspend fun search(query: String, page: Int): SearchResponseList? {
         val url = "$mainUrl/archivio/get-animes"
-        ensureHeadersAndCookies(forceReset = true)
-
-        val requestBody = RequestData(title = query, dubbed = 0).toRequestBody()
-        val response = app.post(url, headers = headers.toMap(), requestBody = requestBody)
-
-        val responseObject = parseJson<ApiResponse>(response.text)
+        val offset = (page - 1).coerceAtLeast(0) * ARCHIVE_BATCH_SIZE
+        val responseObject = fetchArchiveBatch(url, RequestData(title = query, offset = offset, dubbed = 0))
         val titles = responseObject.titles ?: emptyList()
+        val hasNext = titles.isNotEmpty() && offset + titles.size < responseObject.total
 
-        return searchResponseBuilder(titles)
+        return newSearchResponseList(searchResponseBuilder(titles), hasNext)
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> =
+        search(query, 1)?.items ?: emptyList()
+
+    // FORK: ponte INVERSO da id AniList/MyAnimeList alla pagina del titolo. Lo usano HomeIta
+    // (le sue card portano anilist.co/anime/<id>) e la Libreria di CloudStream (aprire un
+    // titolo dalla propria lista). L'archivio si interroga per titolo — l'endpoint non filtra
+    // per id — ma poi si sceglie SOLO il record il cui anilist_id/mal_id coincide esattamente:
+    // mai per somiglianza di titolo, che e' la fonte classica di "episodio sbagliato".
+    override val supportedSyncNames = setOf(SyncIdName.Anilist, SyncIdName.MyAnimeList)
+
+    override suspend fun getLoadUrl(name: SyncIdName, id: String): String? {
+        // SyncRedirector passa l'INTERO match della sua regex ("anilist.co/anime/16498"),
+        // HomeIta il numero nudo: il primo gruppo di cifre e' giusto in entrambi i casi (gli
+        // host non hanno cifre) e resta giusto anche con uno slug dopo l'id.
+        val numericId = Regex("\\d+").find(id)?.value?.toIntOrNull() ?: return null
+        val lookup = ArchiveLookup()
+        var metadataFailed = false
+
+        // I record recenti dell'archivio hanno spesso anilist_id ma NON mal_id: un record vale
+        // se combacia su UNO dei due id, quindi per un id MAL serve anche l'id AniList gemello.
+        // Prima Jikan (AniList va a singhiozzo), AniList solo se il primo giro non basta.
+        val found = if (name == SyncIdName.MyAnimeList) {
+            val jikan = metadata("jikan", numericId) { jikanTitles(numericId) }
+            metadataFailed = jikan.failed
+            lookup.search(jikan.titles, anilistId = null, malId = numericId)
+                ?: metadata("idMal", numericId) { aniListMedia("idMal", numericId) }.let { al ->
+                    metadataFailed = metadataFailed || al.failed
+                    lookup.search(al.titles, al.anilistId, numericId)
+                }
+        } else {
+            metadata("id", numericId) { aniListMedia("id", numericId) }.let { al ->
+                metadataFailed = al.failed
+                lookup.search(al.titles, numericId, al.malId)
+            }
+        }
+
+        val key = "$name:$numericId"
+        if (found != null) {
+            lookupFailures.remove(key)
+            return found
+        }
+        // Il motivo va detto per intero: "non trovato" quando i metadati non sono arrivati
+        // sarebbe una bugia, e l'utente rinuncerebbe a un titolo che c'e'.
+        val reason = when {
+            lookup.archiveError != null -> "Archivio AnimeUnity non raggiungibile (${lookup.archiveError})"
+            metadataFailed && lookup.sawRecords -> "AniList non risponde: impossibile confermare il titolo, riprova"
+            metadataFailed -> "MyAnimeList e AniList non rispondono: riprova piu' tardi"
+            lookup.queries == 0 -> "Id sconosciuto a MyAnimeList e AniList"
+            else -> "Titolo non trovato su AnimeUnity"
+        }
+        if (lookupFailures.size > MAX_LOOKUP_FAILURES) {
+            lookupFailures.keys.firstOrNull()?.let(lookupFailures::remove)
+        }
+        lookupFailures[key] = reason
+        Log.w("AnimeUnity", "getLoadUrl($name $numericId): $reason")
+        return null
+    }
+
+    /** Metadati di un titolo: `failed` distingue "non ha risposto" da "ha risposto: non esiste". */
+    data class Metadata(
+        val anilistId: Int? = null,
+        val malId: Int? = null,
+        val titles: List<String> = emptyList(),
+        val failed: Boolean = false,
+    )
+
+    /** Le stesse domande tornano a ogni card e a ogni click: la risposta si tiene in memoria. */
+    private suspend fun metadata(field: String, id: Int, fetch: suspend () -> Metadata): Metadata {
+        val key = "$field:$id"
+        val now = System.currentTimeMillis()
+        metadataCache[key]?.let { (stamp, cached) ->
+            val ttl = if (cached.failed) METADATA_FAIL_TTL_MS else METADATA_TTL_MS
+            if (now - stamp < ttl) return cached
+        }
+        val fresh = fetch()
+        metadataCache[key] = now to fresh
+        return fresh
+    }
+
+    /**
+     * Una risoluzione: ricorda i record gia' scaricati (valgono anche per gli id scoperti dopo),
+     * i titoli gia' interrogati e l'eventuale errore dell'archivio, per spiegare un fallimento.
+     */
+    private inner class ArchiveLookup {
+        var queries = 0
+        var archiveError: String? = null
+        private val seen = mutableListOf<Anime>()
+        private val queried = mutableSetOf<String>()
+        val sawRecords get() = seen.isNotEmpty()
+
+        private fun pick(anilistId: Int?, malId: Int?): String? {
+            val matches = seen.filter { r ->
+                (anilistId != null && r.anilistId == anilistId) || (malId != null && r.malId == malId)
+            }
+            // sub e dub sono record distinti con lo stesso id: preferisco il sub
+            val hit = matches.firstOrNull { it.dub == 0 } ?: matches.firstOrNull() ?: return null
+            return "$mainUrl/anime/${hit.id}-${hit.slug}"
+        }
+
+        /**
+         * Cerca per titolo (intero, poi senza suffisso di stagione: l'archivio cerca per
+         * sottostringa del SUO titolo) e accetta SOLO un record con id esatto; al massimo
+         * MAX_LOOKUP_PAGES blocchi per query, perche' un franchise con piu' di 30 record puo'
+         * nascondere il bersaglio.
+         */
+        suspend fun search(titles: List<String>, anilistId: Int?, malId: Int?): String? {
+            // i record del giro precedente valgono anche per gli id appena scoperti
+            pick(anilistId, malId)?.let { return it }
+            if (archiveError != null) return null
+
+            val queryTitles = (titles + titles.map(::withoutSeasonSuffix)).filter { it.isNotBlank() }.distinct()
+            for (title in queryTitles) {
+                if (!queried.add(title)) continue
+                var offset = 0
+                while (true) {
+                    val response = runCatching {
+                        fetchArchiveBatch("$mainUrl/archivio/get-animes", RequestData(title = title, offset = offset, dubbed = 0))
+                    }.onFailure {
+                        if (it is CancellationException) throw it
+                        archiveError = it.message ?: it.javaClass.simpleName
+                        Log.w("AnimeUnity", "getLoadUrl: archivio fallito per '$title': ${it.message}")
+                    }.getOrNull()
+                    // un archivio in errore lo e' per tutti i titoli: insistere significherebbe
+                    // decine di handshake e di POST per un solo click
+                    ?: return null
+                    queries++
+                    val records = response.titles.orEmpty()
+                    seen += records
+                    pick(anilistId, malId)?.let { return it }
+                    offset += records.size
+                    if (records.isEmpty() || offset >= response.total || offset >= ARCHIVE_BATCH_SIZE * MAX_LOOKUP_PAGES) break
+                }
+            }
+            return null
+        }
+    }
+
+    private suspend fun jikanTitles(malId: Int): Metadata {
+        val text = runCatching { app.get("https://api.jikan.moe/v4/anime/$malId").let { it to it.text } }
+            .onFailure { if (it is CancellationException) throw it }
+            .getOrNull() ?: return Metadata(failed = true)
+        // 404 = "non esiste", 429/5xx = "non risponde": all'utente vanno detti in modo diverso
+        if (!text.first.isSuccessful) return Metadata(failed = text.first.code != 404)
+        val data = runCatching { JSONObject(text.second).getJSONObject("data") }.getOrNull()
+            ?: return Metadata(failed = true)
+        val titles = listOf("title", "title_english")
+            .mapNotNull { k -> data.optString(k).takeIf { it.isNotBlank() && it != "null" } }
+            .distinct()
+        return Metadata(malId = malId, titles = titles)
+    }
+
+    /** Id gemello e titoli (romaji, inglese) di un media AniList, cercato per `id` o per `idMal`. */
+    private suspend fun aniListMedia(field: String, id: Int): Metadata {
+        val query = "query (\$id: Int) { Media($field: \$id, type: ANIME) { id idMal title { romaji english } } }"
+        val payload = JSONObject().put("query", query).put("variables", JSONObject().put("id", id)).toString()
+        val response = runCatching {
+            app.post(
+                "https://graphql.anilist.co",
+                headers = mapOf("Content-Type" to "application/json", "Accept" to "application/json"),
+                requestBody = payload.toRequestBody("application/json; charset=utf-8".toMediaType()),
+            ).let { it to it.text }
+        }.onFailure { if (it is CancellationException) throw it }
+            .getOrNull() ?: return Metadata(failed = true)
+        if (!response.first.isSuccessful && response.first.code != 404) return Metadata(failed = true)
+        val media = runCatching { JSONObject(response.second).getJSONObject("data").getJSONObject("Media") }.getOrNull()
+            ?: return Metadata(failed = false) // AniList ha risposto: quell'id non esiste
+        val t = media.optJSONObject("title")
+        val titles = listOf("romaji", "english")
+            .mapNotNull { k -> t?.optString(k)?.takeIf { it.isNotBlank() && it != "null" } }
+            .distinct()
+        return Metadata(
+            anilistId = media.optInt("id").takeIf { it > 0 },
+            malId = media.optInt("idMal").takeIf { it > 0 },
+            titles = titles,
+        )
+    }
+
+    /** "Blue Box Season 2" -> "Blue Box", "Re:Zero Season 3 Part 2" -> "Re:Zero" (al massimo due suffissi). */
+    private fun withoutSeasonSuffix(title: String): String {
+        var t = title
+        repeat(2) {
+            val stripped = t.replace(SEASON_SUFFIX, "").trimEnd(' ', ':', '-', '\u2013')
+            if (stripped == t || stripped.isEmpty()) return t
+            t = stripped
+        }
+        return t
     }
 
     override suspend fun load(url: String): LoadResponse {
-        ensureHeadersAndCookies(forceReset = true)
+        // Un URL AniList/MAL arriva qui solo se il SyncRedirector non ha trovato il titolo
+        // (getLoadUrl -> null, ripiego sull'URL originale): meglio un messaggio chiaro che
+        // un errore di parsing sulla pagina di anilist.co.
+        if (SYNC_HOSTS.any { url.contains(it) }) {
+            val name = if (url.contains("myanimelist.net/")) SyncIdName.MyAnimeList else SyncIdName.Anilist
+            val id = Regex("\\d+").find(url)?.value?.toIntOrNull()
+            throw ErrorLoadingException(
+                id?.let { lookupFailures["$name:$it"] } ?: "Titolo non trovato su AnimeUnity"
+            )
+        }
         val animePage = app.get(url).document
         val currentPageData = parseAnimePageData(animePage)
         val currentAnime = currentPageData.anime

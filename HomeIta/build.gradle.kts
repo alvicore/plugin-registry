@@ -1,5 +1,5 @@
 // use an integer for version numbers
-version = 2
+version = 3
 
 cloudstream {
     description = "Home personale guidata da AniList: tendenze, stagione in corso, in onda"
