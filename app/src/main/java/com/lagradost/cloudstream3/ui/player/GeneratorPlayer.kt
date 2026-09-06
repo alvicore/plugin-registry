@@ -141,7 +141,9 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 @OptIn(UnstableApi::class)
-class GeneratorPlayer : FullScreenPlayer() {
+// FORK: aperta per ReliablePlayerFragment (ui/player/reliability), che aggiunge il riavvio
+// dello stesso link e la sorveglianza dei blocchi in caricamento senza toccare questo file.
+open class GeneratorPlayer : FullScreenPlayer() {
     companion object {
         const val NOTIFICATION_ID = 2326
         const val CHANNEL_ID = 7340

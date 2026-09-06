@@ -561,7 +561,7 @@
 
     <fragment
         android:id="@+id/navigation_player"
-        android:name="com.lagradost.cloudstream3.ui.player.GeneratorPlayer"
+        android:name="com.lagradost.cloudstream3.ui.player.reliability.ReliablePlayerFragment"
         android:layout_height="match_parent"
         app:enterAnim="@anim/enter_anim"
         app:exitAnim="@anim/exit_anim"
