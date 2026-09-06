@@ -13,13 +13,18 @@ import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.mainPageOf
+import com.lagradost.cloudstream3.newAnimeLoadResponse
 import com.lagradost.cloudstream3.newAnimeSearchResponse
 import com.lagradost.cloudstream3.newHomePageResponse
+import com.lagradost.nicehttp.NiceResponse
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Calendar
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Home personale: le righe non arrivano da un sito di streaming ma da AniList,
@@ -38,10 +43,11 @@ class HomeItaProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    // Senza questo CloudStream carica le righe con async, tutte insieme: cinque richieste
-    // simultanee superano il limite di Jikan (~3/s) che risponde 429, e la home resta vuota.
-    override var sequentialMainPage = true
-    override var sequentialMainPageDelay = 500L
+    // Con AniList in salute le cinque righe partono davvero insieme: una andata e ritorno
+    // invece di cinque piu' le pause. Quando si ripiega su Jikan si riserializzano comunque
+    // sul jikanMutex, quindi li' il guadagno e' minimo: il tempo vero l'ha tolto load(), che
+    // non passa piu' da AnimeUnity. La pausa fra le espansioni resta, non c'entra con questo.
+    override var sequentialMainPage = false
     override var sequentialMainPageScrollDelay = 500L
 
     override val mainPage = mainPageOf(
@@ -53,6 +59,7 @@ class HomeItaProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val startedAt = System.currentTimeMillis()
         val variables = JSONObject()
             .put("page", page)
             .put("perPage", PER_PAGE)
@@ -82,7 +89,9 @@ class HomeItaProvider : MainAPI() {
         // disabilitata del tutto per giorni). Senza ripiego la home resta vuota anche
         // quando i provider italiani funzionano benissimo.
         if (page0 == null) {
-            return newHomePageResponse(request.name, jikanFallback(request.data, page), false)
+            val fallback = jikanFallback(request.data, page)
+            Log.i(TAG, "riga '${request.name}' da Jikan in ${System.currentTimeMillis() - startedAt}ms (${fallback.size} card)")
+            return newHomePageResponse(request.name, fallback, false)
         }
 
         var items = cards(page0)
@@ -101,11 +110,14 @@ class HomeItaProvider : MainAPI() {
         }
 
         if (items.isEmpty()) {
-            return newHomePageResponse(request.name, jikanFallback(request.data, page), false)
+            val fallback = jikanFallback(request.data, page)
+            Log.i(TAG, "riga '${request.name}' da Jikan in ${System.currentTimeMillis() - startedAt}ms (${fallback.size} card)")
+            return newHomePageResponse(request.name, fallback, false)
         }
 
         val hasNext = page0.optJSONObject("pageInfo")?.optBoolean("hasNextPage") ?: false
 
+        Log.i(TAG, "riga '${request.name}' pronta in ${System.currentTimeMillis() - startedAt}ms (${items.size} card)")
         return newHomePageResponse(request.name, items, hasNext)
     }
 
@@ -120,23 +132,19 @@ class HomeItaProvider : MainAPI() {
      * verso i provider italiani, perche' AnimeUnity espone sia anilist_id sia mal_id.
      */
     private suspend fun jikanFallback(section: String, page: Int): List<SearchResponse> {
-        val path = when (section) {
-            "season" -> "seasons/now?page=$page"
-            "trending" -> "top/anime?filter=airing&page=$page"
-            "airing" -> "anime?status=airing&order_by=popularity&page=$page"
-            "popular" -> "top/anime?filter=bypopularity&page=$page"
-            "top" -> "top/anime?page=$page"
-            else -> "top/anime?page=$page"
+        // Jikan risponde 504 a intermittenza su singole classifiche (misurato il 6/9/2026:
+        // "top/anime?filter=airing" e "anime?status=airing" giu', "seasons/now" e "top/anime"
+        // in piedi). Ogni riga ha quindi un secondo percorso equivalente: meglio una riga con
+        // contenuto simile che una riga vuota.
+        val paths = when (section) {
+            "season" -> listOf("seasons/now?page=$page", "top/anime?filter=airing&page=$page")
+            "trending" -> listOf("top/anime?filter=airing&page=$page", "seasons/now?page=$page")
+            "airing" -> listOf("anime?status=airing&order_by=popularity&page=$page", "seasons/now?page=$page")
+            "popular" -> listOf("top/anime?filter=bypopularity&page=$page", "top/anime?page=$page")
+            else -> listOf("top/anime?page=$page")
         }
 
-        val response = runCatching { app.get("$JIKAN_URL/$path", cacheTime = CACHE_MINUTES) }
-            .onFailure { Log.w(TAG, "Jikan irraggiungibile per '$section': ${it.message}") }
-            .getOrNull() ?: return emptyList()
-        if (!response.isSuccessful) {
-            // 429 = troppe richieste, 504 = MyAnimeList non risponde a Jikan
-            Log.w(TAG, "Jikan ha risposto ${response.code} per '$section'")
-            return emptyList()
-        }
+        val response = paths.firstNotNullOfOrNull { jikanGet(it, section) } ?: return emptyList()
 
         val data = runCatching { JSONObject(response.text).optJSONArray("data") }
             .getOrNull() ?: return emptyList()
@@ -151,7 +159,20 @@ class HomeItaProvider : MainAPI() {
                 ?.optJSONObject("jpg")
                 ?.optNullableString("large_image_url")
 
-            newAnimeSearchResponse(title, "$MAL_URL/anime/$malId", TvType.Anime, fix = false) {
+            val url = "$MAL_URL/anime/$malId"
+            remember(
+                url, Details(
+                    title = title,
+                    poster = poster,
+                    plot = entry.optNullableString("synopsis")?.plainToHtml(),
+                    tags = entry.optJSONArray("genres")?.let { g ->
+                        (0 until g.length()).mapNotNull { g.optJSONObject(it)?.optString("name")?.takeIf(String::isNotBlank) }
+                    },
+                    year = entry.optNullableInt("year"),
+                    score = Score.from10(entry.optDouble("score").takeIf { !it.isNaN() }),
+                )
+            )
+            newAnimeSearchResponse(title, url, TvType.Anime, fix = false) {
                 this.posterUrl = poster
                 this.score = Score.from10(entry.optDouble("score").takeIf { !it.isNaN() })
                 this.year = entry.optNullableInt("year")
@@ -160,22 +181,116 @@ class HomeItaProvider : MainAPI() {
     }
 
     /**
-     * Serve SOLO all'anteprima in cima alla home: HomeViewModel carica le card in evidenza
-     * con il repo della home (questo), senza passare dal SyncRedirector. I click sulle
-     * card NON arrivano qui (apiName = "AnimeUnity"), e non devono: il core verifica che
-     * repo e LoadResponse abbiano lo stesso apiName (debugAssert in toResultData), e la
-     * risposta restituita qui e' di AnimeUnity. Il click sull'anteprima usa apiName e url
-     * della LoadResponse, quindi finisce anch'esso su AnimeUnity.
+     * Jikan misura le richieste: alla quinta a raffica risponde 429 (verificato il 6/9/2026).
+     * Le righe della home ora partono insieme, quindi qui si passa uno alla volta e a distanza,
+     * con un solo secondo tentativo. Senza questo freno, con l'API di AniList disabilitata
+     * (succede: 403 "temporarily disabled") la home resterebbe mezza vuota.
+     */
+    private suspend fun jikanGet(path: String, section: String): NiceResponse? {
+        repeat(2) { attempt ->
+            val response = jikanOnce(path, section)
+            if (response != null && response.isSuccessful) return response
+            val code = response?.code
+            Log.w(TAG, "Jikan ha risposto $code per '$section'${if (attempt == 0 && code == 429) ", riprovo" else ""}")
+            // 429 = troppe richieste: vale un secondo tentativo, ma l'attesa va fatta FUORI dal
+            // lock, altrimenti la riga sfortunata ferma anche le altre quattro.
+            if (code != 429) return null
+            if (attempt == 0) delay(JIKAN_RETRY_MS)
+        }
+        return null
+    }
+
+    /** Una sola richiesta a Jikan, in fila e a distanza dalla precedente. */
+    private suspend fun jikanOnce(path: String, section: String): NiceResponse? =
+        jikanMutex.withLock {
+            val wait = JIKAN_MIN_GAP_MS - (System.currentTimeMillis() - lastJikanCall)
+            if (wait > 0) delay(wait)
+            val response = runCatching { app.get("$JIKAN_URL/$path", cacheTime = CACHE_MINUTES) }
+                .onFailure { Log.w(TAG, "Jikan irraggiungibile per '$section': ${it.message}") }
+                .getOrNull()
+            lastJikanCall = System.currentTimeMillis()
+            response
+        }
+
+    /** Dettagli da Jikan: servono quando AniList non risponde, cioe' spesso. */
+    private suspend fun jikanDetails(malId: Int): Details? {
+        val response = jikanGet("anime/$malId", "dettagli") ?: return null
+        val data = runCatching { JSONObject(response.text).getJSONObject("data") }.getOrNull() ?: return null
+        val title = data.optNullableString("title_english") ?: data.optNullableString("title") ?: return null
+        return Details(
+            title = title,
+            poster = data.optJSONObject("images")?.optJSONObject("jpg")?.optNullableString("large_image_url"),
+            plot = data.optNullableString("synopsis")?.plainToHtml(),
+            tags = data.optJSONArray("genres")?.let { g ->
+                (0 until g.length()).mapNotNull { g.optJSONObject(it)?.optString("name")?.takeIf(String::isNotBlank) }
+            },
+            year = data.optNullableInt("year"),
+            // Jikan scrive "24 min per ep" per le serie ma "1 hr 39 min" per i film:
+            // prendendo solo i minuti un film di 99 minuti ne dichiarerebbe 39.
+            duration = parseJikanDuration(data.optString("duration")),
+            score = Score.from10(data.optDouble("score").takeIf { !it.isNaN() }),
+        )
+    }
+
+    /**
+     * Serve SOLO all'anteprima in cima alla home: HomeViewModel carica tre schede con il repo
+     * della home e pubblica le righe solo DOPO che sono tornate (updatePreviewResponses, poi
+     * _page.postValue). Ogni secondo speso qui e' un secondo di home vuota, e passare da
+     * AnimeUnity (Jikan + AniList + archivio + pagina, per tre titoli) costava piu' di quattro
+     * minuti sul Fire TV Stick: misurato il 6/9/2026.
+     *
+     * Quindi qui non si contatta nessuno: si riusano i dettagli che AniList ha gia' mandato
+     * insieme alle righe. La risposta porta apiName "AnimeUnity" e l'URL della card, cosi' il
+     * click sull'anteprima segue la stessa strada delle card (SyncRedirector -> getLoadUrl).
+     *
+     * PREZZO DA PAGARE, scelto consapevolmente: prima il ponte faceva anche da filtro, perche'
+     * una scheda che AnimeUnity non aveva falliva e il core la scartava dall'anteprima. Ora
+     * l'anteprima e' ottimistica: puo' proporre un titolo che al click non si apre, e l'errore
+     * si vede li' invece che mai. Quattro minuti di home vuota erano peggio.
+     * Limite noto, solo sul layout telefono: il segnalibro salvato dall'anteprima usa l'URL
+     * AniList/MAL, quindi un id diverso da quello della scheda AnimeUnity. Sul layout TV, che
+     * e' quello dei Fire TV Stick, il pulsante segnalibro dell'anteprima non esiste.
      */
     override suspend fun load(url: String): LoadResponse {
-        val (syncName, id) = parseCardUrl(url)
-            ?: throw ErrorLoadingException("Card non riconosciuta: $url")
-        val animeUnity = APIHolder.getApiFromNameNull(ANIME_UNITY)
-            ?: throw ErrorLoadingException("Per aprire i titoli serve il plugin AnimeUnity")
-        val target = animeUnity.getLoadUrl(syncName, id.toString())
-            ?: throw ErrorLoadingException("Titolo non trovato su AnimeUnity ($syncName $id)")
-        return animeUnity.load(target)
-            ?: throw ErrorLoadingException("AnimeUnity non ha restituito la pagina")
+        // Senza AnimeUnity non c'e' nessuno che sappia aprire questi id: meglio dirlo qui che
+        // lasciare una scheda vuota con "nessun episodio".
+        if (APIHolder.getApiFromNameNull(ANIME_UNITY) == null) {
+            throw ErrorLoadingException("Per aprire i titoli serve il plugin AnimeUnity")
+        }
+        val details = readDetails(url) ?: fetchDetails(url)
+            ?: throw ErrorLoadingException("Dettagli non disponibili per $url")
+
+        return newAnimeLoadResponse(details.title, url, TvType.Anime, comingSoonIfNone = false) {
+            this.posterUrl = details.poster
+            this.backgroundPosterUrl = details.banner ?: details.poster
+            this.plot = details.plot
+            this.tags = details.tags
+            this.year = details.year
+            this.duration = details.duration
+            this.score = details.score
+        }.copy(apiName = ANIME_UNITY)
+    }
+
+    /** Ripiego per un URL che non viene dalle righe appena caricate (una sola richiesta). */
+    private suspend fun fetchDetails(url: String): Details? {
+        val (syncName, id) = parseCardUrl(url) ?: return null
+        val field = if (syncName == SyncIdName.MyAnimeList) "idMal" else "id"
+        val variables = JSONObject().put("id", id)
+        val media = graphQl(MEDIA_QUERY.replace("FIELD", field), variables)?.optJSONObject("Media")
+            ?: return if (syncName == SyncIdName.MyAnimeList) jikanDetails(id) else null
+        val title = preferredTitle(media.optJSONObject("title")) ?: return null
+        return Details(
+            title = title,
+            poster = media.optJSONObject("coverImage")?.let {
+                it.optNullableString("extraLarge") ?: it.optNullableString("large")
+            },
+            banner = media.optNullableString("bannerImage"),
+            plot = media.optNullableString("description"),
+            tags = media.optJSONArray("genres")?.let { g -> (0 until g.length()).mapNotNull { g.optString(it).takeIf(String::isNotBlank) } },
+            year = media.optNullableInt("seasonYear"),
+            duration = media.optNullableInt("duration"),
+            score = Score.from100(media.optNullableInt("averageScore")),
+        )
     }
 
     private fun parseCardUrl(url: String): Pair<SyncIdName, Int>? {
@@ -190,6 +305,12 @@ class HomeItaProvider : MainAPI() {
     // lancia NotImplementedError e la ricerca scarta questa fonte in modo pulito.
 
     /** Titolo preferito: inglese se c'e', altrimenti romaji. */
+    private fun parseJikanDuration(raw: String): Int? {
+        val hours = Regex("(\\d+)\\s*hr").find(raw)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val minutes = Regex("(\\d+)\\s*min").find(raw)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        return (hours * 60 + minutes).takeIf { it > 0 }
+    }
+
     private fun preferredTitle(title: JSONObject?): String? {
         if (title == null) return null
         return title.optNullableString("english")
@@ -208,6 +329,22 @@ class HomeItaProvider : MainAPI() {
         // al click non si dipende da AniList, che va a singhiozzo (timeout e 500 il 6/9/2026).
         // L'id AniList resta per i pochi titoli senza controparte MAL.
         val url = entry.optNullableInt("idMal")?.let { "$MAL_URL/anime/$it" } ?: "$mainUrl/anime/$id"
+
+        // La stessa risposta di AniList porta gia' tutto quello che l'anteprima mostra: si tiene
+        // da parte, cosi' load() non deve chiedere niente a nessuno (vedi il commento in load).
+        remember(
+            url, Details(
+                title = title,
+                poster = poster,
+                banner = entry.optNullableString("bannerImage"),
+                plot = entry.optNullableString("description"),
+                tags = entry.optJSONArray("genres")?.let { g -> (0 until g.length()).mapNotNull { g.optString(it).takeIf(String::isNotBlank) } },
+                year = entry.optNullableInt("seasonYear"),
+                duration = entry.optNullableInt("duration"),
+                score = Score.from100(entry.optNullableInt("averageScore")),
+            )
+        )
+
         // apiName e' in sola lettura negli stub dei plugin: si imposta con copy() della data class
         return newAnimeSearchResponse(title, url, TvType.Anime, fix = false) {
             this.posterUrl = poster
@@ -216,13 +353,57 @@ class HomeItaProvider : MainAPI() {
         }.copy(apiName = ANIME_UNITY)
     }
 
+    private data class Details(
+        val title: String,
+        val poster: String?,
+        val banner: String? = null,
+        val plot: String? = null,
+        val tags: List<String>? = null,
+        val year: Int? = null,
+        val duration: Int? = null,
+        val score: Score? = null,
+    )
+
+    private fun remember(url: String, details: Details) = synchronized(detailsCache) {
+        detailsCache[url] = details
+    }
+
+    private fun readDetails(url: String): Details? = synchronized(detailsCache) { detailsCache[url] }
+
+    /**
+     * Il core passa la trama a HtmlCompat.fromHtml prima di mostrarla, quindi l'HTML di AniList
+     * va lasciato com'e' (i <br> diventano a capo, <i> corsivo). Jikan invece manda testo
+     * semplice: li' i ritorni a capo vanno tradotti, o il parser HTML li mangia.
+     */
+    private fun String.plainToHtml(): String = trim().replace("\n", "<br>")
+
+    /** Una richiesta ad AniList, con un solo secondo tentativo se risponde 429. */
     private suspend fun graphQl(query: String, variables: JSONObject): JSONObject? {
+        val response = graphQlOnce(query, variables) ?: return null
+        if (response.isSuccessful) {
+            return runCatching { JSONObject(response.text).optJSONObject("data") }.getOrNull()
+        }
+        // 429 = solo troppe richieste: aspettare un attimo costa meno che ripiegare su Jikan,
+        // che e' piu' lento e a sua volta contingentato. Ogni altro codice (il 403 di "API
+        // temporaneamente disabilitata", i 5xx) e' un problema che l'attesa non risolve.
+        if (response.code != 429) {
+            Log.w(TAG, "AniList ha risposto ${response.code}")
+            return null
+        }
+        val wait = response.headers["Retry-After"]?.toLongOrNull()?.coerceAtMost(5)?.times(1000)
+            ?: ANILIST_RETRY_MS
+        Log.w(TAG, "AniList ha risposto 429, riprovo fra ${wait}ms")
+        delay(wait)
+        val retry = graphQlOnce(query, variables)?.takeIf { it.isSuccessful } ?: return null
+        return runCatching { JSONObject(retry.text).optJSONObject("data") }.getOrNull()
+    }
+
+    private suspend fun graphQlOnce(query: String, variables: JSONObject): NiceResponse? {
         val body = JSONObject()
             .put("query", query)
             .put("variables", variables)
             .toString()
-
-        val response = runCatching {
+        return runCatching {
             app.post(
                 API_URL,
                 headers = mapOf(
@@ -232,14 +413,7 @@ class HomeItaProvider : MainAPI() {
                 requestBody = body.toRequestBody(JSON_MEDIA_TYPE),
                 cacheTime = CACHE_MINUTES,
             )
-        }.onFailure { Log.w(TAG, "AniList irraggiungibile: ${it.message}") }
-            .getOrNull() ?: return null
-
-        if (!response.isSuccessful) {
-            Log.w(TAG, "AniList ha risposto ${response.code}")
-            return null
-        }
-        return runCatching { JSONObject(response.text).optJSONObject("data") }.getOrNull()
+        }.onFailure { Log.w(TAG, "AniList irraggiungibile: ${it.message}") }.getOrNull()
     }
 
     /**
@@ -284,8 +458,39 @@ class HomeItaProvider : MainAPI() {
         private const val MAL_URL = "https://myanimelist.net"
         private const val PER_PAGE = 30
         private const val MIN_SEASON_ITEMS = 10
+        private const val MAX_DETAILS = 400
+        private val jikanMutex = Mutex()
+        private const val JIKAN_MIN_GAP_MS = 400L
+        private const val JIKAN_RETRY_MS = 1500L
+        private const val ANILIST_RETRY_MS = 1000L
+        @Volatile
+        private var lastJikanCall = 0L
+        // i dettagli arrivati con le righe, riusati dall'anteprima senza altre richieste
+        // LinkedHashMap in ordine di accesso: quando si sfratta se ne va la voce usata da
+        // piu' tempo, non una a caso (ConcurrentHashMap.keys.first e' il primo bucket, che
+        // con la home aperta a lungo poteva buttare proprio le card dell'anteprima).
+        private val detailsCache = object : LinkedHashMap<String, Details>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Details>?) = size > MAX_DETAILS
+        }
         private const val CACHE_MINUTES = 10
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        private val MEDIA_QUERY = """
+            query (${'$'}id: Int) {
+              Media(FIELD: ${'$'}id, type: ANIME) {
+                id
+                idMal
+                title { romaji english native }
+                coverImage { extraLarge large }
+                bannerImage
+                description(asHtml: false)
+                genres
+                duration
+                averageScore
+                seasonYear
+              }
+            }
+        """.trimIndent()
 
         private val PAGE_QUERY = """
             query (${'$'}page: Int, ${'$'}perPage: Int, ${'$'}sort: [MediaSort], ${'$'}status: MediaStatus,
@@ -298,6 +503,10 @@ class HomeItaProvider : MainAPI() {
                   idMal
                   title { romaji english native }
                   coverImage { extraLarge large }
+                  bannerImage
+                  description(asHtml: false)
+                  genres
+                  duration
                   averageScore
                   episodes
                   seasonYear

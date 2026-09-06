@@ -1,5 +1,5 @@
 // use an integer for version numbers
-version = 3
+version = 4
 
 cloudstream {
     description = "Home personale guidata da AniList: tendenze, stagione in corso, in onda"
@@ -20,4 +20,10 @@ cloudstream {
     language = "it"
 
     iconUrl = "https://anilist.co/img/icons/favicon-32x32.png"
+}
+
+dependencies {
+    // Mutex per serializzare il ripiego Jikan. A runtime le coroutine le fornisce l'app,
+    // quindi compileOnly: dentro il .cs3 non deve finirci una seconda copia.
+    compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 }
