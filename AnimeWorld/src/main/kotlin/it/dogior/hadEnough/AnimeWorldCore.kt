@@ -1,5 +1,7 @@
 package it.dogior.hadEnough
 
+import com.lagradost.api.Log
+import java.util.concurrent.atomic.AtomicInteger
 import com.lagradost.cloudstream3.AnimeSearchResponse
 import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.ErrorLoadingException
@@ -399,27 +401,37 @@ open class AnimeWorldCore(isSplit: Boolean = false, val currentExtension: Curren
         }
         if (apiResults.isEmpty()) return false
 
-        apiResults.amap {
-            if (it.target.contains("AnimeWorld")) {
-                callback.invoke(
-                    newExtractorLink(
-                        name,
-                        "AnimeWorld",
-                        it.grabber,
-                    ) {
-                        this.referer = mainUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-
-            } else if (it.target.contains("listeamed.net")) {
-                loadExtractor(it.grabber, null, subtitleCallback, callback)
-//                VidguardExtractor().getUrl(it.grabber, null, subtitleCallback, callback)
-            } else {
-                null
+        // FORK: per il core "true" significa "ho finito, non serve richiamarmi": la cache dei
+        // link viene marcata completa e non si tocca per venti minuti. Dichiararlo anche quando
+        // una sorgente e' saltata lasciava l'episodio senza quel mirror per tutto quel tempo.
+        // Ogni sorgente e' anche isolata: una rotta non deve impedire le altre.
+        val emitted = AtomicInteger(0)
+        val failed = AtomicInteger(0)
+        apiResults.amap { source ->
+            runCatching {
+                if (source.target.contains("AnimeWorld")) {
+                    callback.invoke(
+                        newExtractorLink(
+                            name,
+                            "AnimeWorld",
+                            source.grabber,
+                        ) {
+                            this.referer = mainUrl
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                    emitted.incrementAndGet()
+                } else if (source.target.contains("listeamed.net")) {
+                    loadExtractor(source.grabber, null, subtitleCallback, callback)
+                    emitted.incrementAndGet()
+                }
+                // altri target non sono supportati: non e' un guasto, riprovare non aiuterebbe
+            }.onFailure {
+                failed.incrementAndGet()
+                Log.w("AnimeWorld", "Sorgente '${source.target}' fallita: ${it.message}")
             }
-        }.filterNotNull()
-        return true
+        }
+        return emitted.get() > 0 && failed.get() == 0
     }
 
     enum class CurrentExtension {

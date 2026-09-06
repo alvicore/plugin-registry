@@ -522,7 +522,7 @@ class StreamingCommunity(
         // ricava il suo URL da loadData, non da questa risposta). Dentro il primo blocco c'e'
         // anche la fetch dell'iframe: e' la parte con la superficie di guasto piu' grande
         // (rete, DNS, timeout) e lasciarla fuori vanificava meta' della correzione.
-        runCatching {
+        val vixCloudOk = runCatching {
             val response = app.get(loadData.url).document
             val iframeSrc = response.select("iframe").attr("src")
             VixCloudExtractor().getUrl(
@@ -531,7 +531,7 @@ class StreamingCommunity(
                 subtitleCallback = subtitleCallback,
                 callback = callback
             )
-        }.onFailure { Log.w("StreamingCommunity", "VixCloud fallito: ${it.message}") }
+        }.onFailure { Log.w("StreamingCommunity", "VixCloud fallito: ${it.message}") }.isSuccess
 
         val vixsrcUrl = if (loadData.type == "movie") {
             "https://vixsrc.to/movie/${loadData.tmdbId}"
@@ -539,15 +539,19 @@ class StreamingCommunity(
             "https://vixsrc.to/tv/${loadData.tmdbId}/${loadData.seasonNumber}/${loadData.episodeNumber}"
         }
 
-        runCatching {
+        val vixSrcOk = runCatching {
             VixSrcExtractor().getUrl(
                 url = vixsrcUrl,
                 referer = "https://vixsrc.to/",
                 subtitleCallback = subtitleCallback,
                 callback = callback
             )
-        }.onFailure { Log.w("StreamingCommunity", "VixSrc fallito: ${it.message}") }
+        }.onFailure { Log.w("StreamingCommunity", "VixSrc fallito: ${it.message}") }.isSuccess
 
-        return true
+        // FORK: "true" per il core vuol dire "ho finito, la lista e' completa", e blocca nuovi
+        // tentativi per venti minuti. Se una delle due sorgenti e' saltata va detto: al prossimo
+        // avvio dell'episodio verra' ricercata, mentre quella riuscita resta in cache e non
+        // viene riscaricata (il core deduplica per URL).
+        return vixCloudOk && vixSrcOk
     }
 }
