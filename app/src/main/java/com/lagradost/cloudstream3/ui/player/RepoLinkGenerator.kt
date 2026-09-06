@@ -152,7 +152,11 @@ class RepoLinkGenerator(
         )
 
         synchronized(currentCache) {
-            currentCache.saturated = currentCache.linkCache.isNotEmpty()
+            // FORK: "saturated" deve voler dire "il provider ha finito davvero". Prima bastava un
+            // link parziale: APIRepository.loadLinks ritorna false anche su timeout e cancellazione
+            // (il preload del prossimo episodio viene annullato da "episodio successivo"), e la
+            // meta' di cache restava "completa" per 20 minuti senza cercare i link mancanti.
+            currentCache.saturated = result && currentCache.linkCache.isNotEmpty()
             currentCache.lastCachedTimestamp = unixTime
         }
 
