@@ -136,7 +136,13 @@ val appLanguages = arrayListOf(
     Pair("正體中文(臺灣)", "zh-TW"),
     Pair("한국어", "ko"),
 /* end language list */
-).sortedBy { it.first.lowercase(Locale.ROOT) } // ye, we go alphabetical, so ppl don't put their lang on top
+)
+    // FORK: il blocco qui sopra e' rigenerato da .github/locales.py a ogni tornata di
+    // traduzioni upstream, quindi non si tocca: filtriamo fuori dai marcatori.
+    // 62 lingue su un telecomando sono una trappola — bastano due pressioni sbagliate per
+    // finire in una lingua che non si sa leggere, ed e' successo davvero durante il collaudo.
+    .filter { (_, tag) -> tag in setOf("it", "en", "es", "fr", "de", "pt") }
+    .sortedBy { it.first.lowercase(Locale.ROOT) } // ye, we go alphabetical, so ppl don't put their lang on top
 
 fun Pair<String, String>.nameNextToFlagEmoji(): String {
     // fallback to [A][A] -> [?] question mak flag

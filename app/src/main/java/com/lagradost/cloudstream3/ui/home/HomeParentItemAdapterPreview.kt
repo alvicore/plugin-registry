@@ -684,6 +684,8 @@ class HomeParentItemAdapterPreview(
                     alternativeAccountPadding?.isVisible = false
                     (binding as? FragmentHomeHeadTvBinding)?.apply {
                         homePreviewInfoBtt.isVisible = true
+                        homePreviewHiddenPrevFocus.isVisible = true
+                        homePreviewHiddenNextFocus.isVisible = true
                     }
                     // Explicitly bind the current item to ensure instant loading
                     val currentPos = previewViewpager.currentItem
@@ -701,6 +703,10 @@ class HomeParentItemAdapterPreview(
                     alternativeAccountPadding?.isVisible = true
                     (binding as? FragmentHomeHeadTvBinding)?.apply {
                         homePreviewInfoBtt.isVisible = false
+                        // FORK: senza anteprima questi due rimbalzano il focus sulla barra
+                        // laterale, rendendo la home vuota impossibile da attraversare col D-pad.
+                        homePreviewHiddenPrevFocus.isVisible = false
+                        homePreviewHiddenNextFocus.isVisible = false
                     }
                     //previewHeader.isVisible = false
                 }

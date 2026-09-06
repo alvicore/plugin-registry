@@ -327,6 +327,12 @@ class HomeViewModel : ViewModel() {
         _randomItems.postValue(listOf())
 
         if (repo?.hasMainPage != true) {
+            // FORK: valutato e SCARTATO il passaggio a Resource.Failure per mostrare un
+            // messaggio: la schermata d'errore copre tutto l'header TV, quindi farebbe
+            // sparire "Continua a guardare" e i Preferiti, che sono dati locali e
+            // funzionano anche senza provider. La home vuota resta attraversabile grazie
+            // alla correzione dei trampolini di focus in HomeParentItemAdapterPreview:
+            // il pulsante del selettore sta fuori dal recycler ed e' sempre raggiungibile.
             _page.postValue(Resource.Success(emptyMap()))
             _preview.postValue(Resource.Failure(false, "No homepage"))
             return@ioSafe

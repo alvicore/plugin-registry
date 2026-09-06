@@ -129,7 +129,14 @@ object DataStoreHelper {
 
     private var homePreferenceStrings: List<String> by UserPreferenceDelegate(
         "home_pref_homepage",
-        listOf(TvType.Movie, TvType.TvSeries).map { it.name })
+        // FORK: il default upstream e' [Movie, TvSeries]. HomeFragment filtra i provider
+        // del selettore con supportedTypes.any(preSelectedTypes::contains), quindi con quel
+        // default i provider anime (Anime/AnimeMovie/OVA) non compaiono affatto e la home
+        // resta vuota senza spiegazione.
+        listOf(
+            TvType.Anime, TvType.AnimeMovie, TvType.OVA,
+            TvType.Movie, TvType.TvSeries
+        ).map { it.name })
 
     var homePreference: List<TvType>
         get() = deserializeTv(homePreferenceStrings)
